@@ -236,14 +236,22 @@ struct YourFaceSettingsPage: View {
         )
     }
 
+    /// Touch ID first, even with the session unlocked. This changes which faces can unlock the Mac,
+    /// so it is authorized in its own right rather than on the strength of a session that may have
+    /// been unlocked days ago — see `SecureCredentialManager.requireFreshUserPresence`.
     private func delete(_ identity: FaceIdentity) {
-        do {
-            try store.delete(identity)
-            writeError = nil
-        } catch {
-            writeError = error.localizedDescription
-        }
         identityPendingDeletion = nil
+        Task {
+            guard await SecureCredentialManager.confirmUserPresence(
+                reason: "Authenticate to delete an enrolled face"
+            ) else { return }
+            do {
+                try store.delete(identity)
+                writeError = nil
+            } catch {
+                writeError = error.localizedDescription
+            }
+        }
     }
 
     private func unlock() {

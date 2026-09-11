@@ -176,7 +176,10 @@ final class FaceLabController {
 
     // MARK: - Enrollment
 
-    func captureSample() {
+    /// Prompts for Touch ID before writing, even though the session is already unlocked — this
+    /// writes into the same store the unlock path reads, so it grants a new way to unlock the Mac.
+    /// See `SecureCredentialManager.requireFreshUserPresence`.
+    func captureSample() async {
         guard let result = currentResult else {
             log("No face detected — can't capture a sample.")
             return
@@ -184,6 +187,12 @@ final class FaceLabController {
         let trimmedName = enrollName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else {
             log("Enter a name before capturing a sample.")
+            return
+        }
+        guard await SecureCredentialManager.confirmUserPresence(
+            reason: "Authenticate to add a face that can unlock this Mac"
+        ) else {
+            log("Cancelled — a sample was not captured.")
             return
         }
         do {
@@ -199,7 +208,15 @@ final class FaceLabController {
         }
     }
 
-    func deleteIdentity(_ identity: FaceIdentity) {
+    /// Gated for the same reason as `captureSample`: this mutates the set of faces that can unlock
+    /// the Mac, and removing the owner's identity is a step toward replacing it.
+    func deleteIdentity(_ identity: FaceIdentity) async {
+        guard await SecureCredentialManager.confirmUserPresence(
+            reason: "Authenticate to delete an enrolled face"
+        ) else {
+            log("Cancelled — \"\(identity.name)\" was not deleted.")
+            return
+        }
         do {
             try store.delete(identity)
             log("Deleted \"\(identity.name)\".")

@@ -282,11 +282,25 @@ final class OnboardingController {
 
     /// Enrollment-only flows persist as soon as naming is confirmed, so Touch ID has to
     /// happen up front — there's no later password step to unlock the session.
+    ///
+    /// Always prompts, even when the session is already unlocked. This used to open with
+    /// `guard !SecureCredentialManager.isSessionUnlocked else { return true }`, which made
+    /// enrollment free for anyone standing at an already-unlocked Mac: add your own face in under
+    /// a minute, with no prompt and no trace, and from then on your face makes this Mac type its
+    /// owner's login password. The session is warm nearly all the time — the shortest auto-lock
+    /// interval is one day and every unlock resets it — so that guard was almost always taken.
+    ///
+    /// Enrolling a face is not *using* the credential, it is *granting* a new way to use it, and
+    /// has to be authorized on its own. See `SecureCredentialManager.requireFreshUserPresence`.
     private static func unlockForEnrollment(reason: String) async -> Bool {
-        guard !SecureCredentialManager.isSessionUnlocked else { return true }
         do {
             try await Task.detached(priority: .userInitiated) {
-                try SecureCredentialManager.unlockSession(reason: reason)
+                // Establishes the session on first run; re-authorizes on every subsequent call.
+                if !SecureCredentialManager.isSessionUnlocked {
+                    try SecureCredentialManager.unlockSession(reason: reason)
+                } else {
+                    try SecureCredentialManager.requireFreshUserPresence(reason: reason)
+                }
             }.value
             return true
         } catch {

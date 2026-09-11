@@ -166,6 +166,46 @@ enum SecureCredentialManager {
         setCachedKey(nil)
     }
 
+    /// Forces a Touch ID evaluation now, regardless of whether the session is already unlocked.
+    /// Blocking; call from a background task.
+    ///
+    /// `unlockSession` returns immediately when `_cachedKey` is already set, which is right for
+    /// *using* the credential but wrong for *changing who can use it*. Adding, replacing or
+    /// deleting an enrolled face is credential-equivalent: it creates a new way to make this Mac
+    /// type the login password. Satisfying that with a session unlocked days ago means a minute at
+    /// an already-unlocked Mac is enough to enroll a stranger's face, with no prompt and no trace —
+    /// and the session is effectively always warm, since the shortest auto-lock interval is a day
+    /// and `recordActivity()` resets it on every unlock.
+    ///
+    /// macOS re-prompts to add a fingerprint even inside an unlocked session, for this reason.
+    ///
+    /// A freshly constructed `LAContext` has `touchIDAuthenticationAllowableReuseDuration` of 0, so
+    /// the OS always presents the prompt during this call rather than reusing a recent unlock. The
+    /// read's result is discarded — the point is the authentication, not the bytes. Throws if the
+    /// user cancels or no key exists yet, and callers must treat a throw as "do not proceed".
+    nonisolated static func requireFreshUserPresence(reason: String) throws {
+        let context = LAContext()
+        context.localizedReason = reason
+        _ = try KeychainManager.read(account: sessionKeyAccount, context: context)
+    }
+
+    /// Awaitable form of `requireFreshUserPresence` for UI call sites, which are on the MainActor
+    /// and must not block it on a Keychain round-trip plus a Touch ID prompt.
+    ///
+    /// Returns `false` on cancellation or any failure, so callers read as
+    /// `guard await confirmUserPresence(...) else { return }` and a declined prompt simply
+    /// abandons the action.
+    nonisolated static func confirmUserPresence(reason: String) async -> Bool {
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                try requireFreshUserPresence(reason: reason)
+            }.value
+            return true
+        } catch {
+            return false
+        }
+    }
+
     /// Encrypts and stores `passwordBytes`. Requires an unlocked session —
     /// call `unlockSession(reason:)` first. Blocking; call from a background task.
     nonisolated static func savePassword(_ passwordBytes: Data) throws {

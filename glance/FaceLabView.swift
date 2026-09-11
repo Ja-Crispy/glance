@@ -398,7 +398,7 @@ struct FaceLabView: View {
                     TextField("Name", text: $controller.enrollName)
                         .textFieldStyle(.roundedBorder)
                     Button("Capture Sample") {
-                        controller.captureSample()
+                        Task { await controller.captureSample() }
                     }
                     .disabled(controller.currentResult == nil || controller.store.isLocked)
                 }
@@ -421,7 +421,7 @@ struct FaceLabView: View {
                             }
                             Spacer()
                             Button(role: .destructive) {
-                                controller.deleteIdentity(identity)
+                                Task { await controller.deleteIdentity(identity) }
                             } label: {
                                 Image(systemName: "trash")
                             }
@@ -464,7 +464,7 @@ struct FaceLabView: View {
                             lowQualityCount: controller.lowQualityCount(in: identity),
                             canStartFlow: !enrollmentFlowIsRunning,
                             recapture: { controller.startRecapture(of: identity) },
-                            delete: { controller.deleteIdentity(identity) }
+                            delete: { Task { await controller.deleteIdentity(identity) } }
                         )
                     }
                 }
