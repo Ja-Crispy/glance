@@ -74,6 +74,45 @@ final class FaceUnlockCoordinator {
     private var injectionCooldownUntil: ContinuousClock.Instant?
     private let injectionCooldown: Duration = .seconds(4)
 
+    /// Failed attempts charged against the current lock session, cleared by a real unlock.
+    ///
+    /// There was no lockout, backoff or attempt ceiling anywhere in the app. Three channels
+    /// re-arm a scan — notch hover, the space key, and wake/lid events — each with a fresh
+    /// `LivenessAnalyzer`, at roughly twelve scans a minute, indefinitely. That is what turns a
+    /// small per-attempt false-accept probability into a near-certainty over an unattended night,
+    /// and it is what makes every other weakness in the recognition and liveness paths actually
+    /// exploitable rather than merely theoretical. Touch ID allows five failures before demanding
+    /// the password; this now does the same.
+    private var failureBudgetSpent = 0
+    private let failureBudgetPerLock = 5
+    /// Set by `recordScanOutcome`; `startScanCycle` refuses to start before it.
+    private var nextScanNotBefore: ContinuousClock.Instant?
+
+    /// Charges a finished scan against the budget and sets the backoff for the next one.
+    ///
+    /// A suspected spoof costs double. Being caught presenting a photo should not cost an attacker
+    /// exactly what being an unrecognised passer-by costs — which, before this, was nothing.
+    /// `.noResolution` is free: nobody was in front of the camera, so charging it would let a
+    /// housemate walking past burn the owner's budget.
+    private func recordScanOutcome(_ outcome: ScanOutcome) {
+        switch outcome {
+        case .matched:
+            failureBudgetSpent = 0
+            nextScanNotBefore = nil
+            return
+        case .spoofSuspected:
+            failureBudgetSpent += 2
+        case .consistentlyWrongFace, .injectionFailed:
+            failureBudgetSpent += 1
+        case .noResolution:
+            return
+        }
+        // 2s, 4s, 8s, 16s, capped at 30. Applied at the single choke point every channel goes
+        // through, so hover and the space key cannot be used as an unbounded oracle either.
+        let seconds = min(1 << min(failureBudgetSpent, 5), 30)
+        nextScanNotBefore = ContinuousClock.now.advanced(by: .seconds(seconds))
+    }
+
     /// When off, no notch/pill presence at all — every overlay call in this file is conditioned on this rather than just skipping the video.
     private var showsUI: Bool { GlanceSettings.shared.showUnlockAnimation }
 
@@ -119,6 +158,12 @@ final class FaceUnlockCoordinator {
         guard LockMonitor.isScreenActuallyLocked() else {
             hasArmedForCurrentLock = false
             hasAutoRetriedForCurrentLock = false
+            // The budget is per lock session. Reaching here means the Mac is genuinely unlocked —
+            // by password, Touch ID, Watch, or by us — which is the only thing that should restore
+            // a spent budget. Anything weaker would let an attacker reset it by inducing a state
+            // change rather than by actually authenticating.
+            failureBudgetSpent = 0
+            nextScanNotBefore = nil
             disarmOverlay()
             return
         }
@@ -248,6 +293,15 @@ final class FaceUnlockCoordinator {
 
     /// Called on arm, and again whenever the overlay hover-activates.
     private func startScanCycle() {
+        // The single choke point for every way a scan can begin — hover, space key, wake/lock, and
+        // the auto-retry — so the budget and backoff are enforced once, here, rather than at four
+        // call sites that could drift apart.
+        guard failureBudgetSpent < failureBudgetPerLock else {
+            statusMessage = "Too many failed attempts — unlock with your password to re-enable Face Unlock."
+            return
+        }
+        if let notBefore = nextScanNotBefore, ContinuousClock.now < notBefore { return }
+
         scanTask?.cancel()
         scanGeneration &+= 1
         let generation = scanGeneration
@@ -288,6 +342,7 @@ final class FaceUnlockCoordinator {
         guard generation == scanGeneration else { return }
 
         camera.stop()
+        recordScanOutcome(outcome)
 
         switch outcome {
         case .matched:
