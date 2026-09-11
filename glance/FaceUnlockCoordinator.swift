@@ -56,6 +56,13 @@ final class FaceUnlockCoordinator {
     /// Gap between headless auto-retries, just to keep the camera from restarting in a tight loop.
     private let headlessRetryDelay: Duration = .seconds(1)
 
+    /// Set when an injection actually typed. See the note at the top of `evaluateTrigger()` — this
+    /// blocks the app's own successful unlock from re-arming a scan against the desktop it just
+    /// unlocked. Long enough to outlast the login window's dismissal animation and the burst of
+    /// wake/screensaver notifications that follows it.
+    private var injectionCooldownUntil: ContinuousClock.Instant?
+    private let injectionCooldown: Duration = .seconds(4)
+
     /// When off, no notch/pill presence at all — every overlay call in this file is conditioned on this rather than just skipping the video.
     private var showsUI: Bool { GlanceSettings.shared.showUnlockAnimation }
 
@@ -89,6 +96,15 @@ final class FaceUnlockCoordinator {
     }
 
     private func evaluateTrigger() {
+        // A successful injection ends with Return, which stops the screensaver, which fires
+        // `com.apple.screensaver.didstop` — one of the notifications this very method is woken by.
+        // The `.wake` branch below then clears `hasArmedForCurrentLock` and re-arms, behind nothing
+        // but a 300ms settle on a CGSession value that LockMonitor's own comment documents as
+        // lagging the truth. So the app's own unlock could immediately re-arm a scan whose next
+        // match types the password onto the desktop it just revealed. For this window we refuse to
+        // arm regardless of what CGSession reports.
+        if let until = injectionCooldownUntil, ContinuousClock.now < until { return }
+
         guard LockMonitor.isScreenActuallyLocked() else {
             hasArmedForCurrentLock = false
             hasAutoRetriedForCurrentLock = false
@@ -253,7 +269,8 @@ final class FaceUnlockCoordinator {
 
         let outcome = await observeScanWindow(
             deadline: Date().addingTimeInterval(scanWindowDuration),
-            requireOverlayScanning: showsUI
+            requireOverlayScanning: showsUI,
+            generation: generation
         )
 
         // A newer cycle now owns the camera and overlay — leave both alone, and leave the auto-retry one-shot unspent.
@@ -281,6 +298,18 @@ final class FaceUnlockCoordinator {
             if showsUI {
                 NotchOverlayController.shared.finish(success: false)
                 statusMessage = "Couldn't confirm a live face — hover the notch to try again."
+                scheduleAutoRetryIfEnabled(after: NotchOverlayController.shared.failureHoldDuration)
+            } else {
+                scheduleAutoRetryIfEnabled(after: headlessRetryDelay)
+            }
+        case .injectionFailed:
+            // Shown as a failure, because it is one: the face was accepted but the Mac is still
+            // locked. Previously this path was indistinguishable from `.matched` and played the
+            // success animation, so a missing Accessibility grant or a mid-type unlock looked to
+            // the user exactly like a working unlock that they then had to repeat by hand.
+            statusMessage = lastOutcome ?? "Recognized, but couldn't enter the password."
+            if showsUI {
+                NotchOverlayController.shared.finish(success: false)
                 scheduleAutoRetryIfEnabled(after: NotchOverlayController.shared.failureHoldDuration)
             } else {
                 scheduleAutoRetryIfEnabled(after: headlessRetryDelay)
@@ -319,6 +348,11 @@ final class FaceUnlockCoordinator {
         case consistentlyWrongFace
         /// A deny cue (glare, device rectangle) fired — actively rejected as a spoof regardless of match. Same failure path as `.consistentlyWrongFace`.
         case spoofSuspected
+        /// The face matched but the keystrokes did not go out — no Accessibility grant, the screen
+        /// unlocked mid-type, or another injection already in flight. Distinct from `.matched`
+        /// because the Mac is still locked, and the overlay must not play the success animation
+        /// over a failure the user would otherwise never see.
+        case injectionFailed
         case noResolution
     }
 
@@ -326,7 +360,9 @@ final class FaceUnlockCoordinator {
     /// liveness never fails the scan by staying undecided, it just keeps scanning until `deadline`.
     /// `requireOverlayScanning` bails early once the overlay's own timeout collapses the UI — only applied when there is an
     /// overlay, since headlessly `phase` never becomes `.scanning` at all.
-    private func observeScanWindow(deadline: Date, requireOverlayScanning: Bool) async -> ScanOutcome {
+    private func observeScanWindow(
+        deadline: Date, requireOverlayScanning: Bool, generation: Int
+    ) async -> ScanOutcome {
         let livenessEnabled = GlanceSettings.shared.livenessChecksEnabled
         let liveness = LivenessAnalyzer()
         liveness.modeProvider = { GlanceSettings.shared.livenessMode }
@@ -401,12 +437,26 @@ final class FaceUnlockCoordinator {
             }
 
             if let readyMatch, livenessConfirmed {
+                // Checked HERE, not only in the `while` condition. Two suspension points sit
+                // between that check and this line — the detached recognition pass and the
+                // liveness observe — and a disarm landing inside either of them (isEnabled
+                // switched off, an unlock, a newer cycle superseding this one) must not still be
+                // able to type the password. `Task.cancel()` is cooperative and nothing in the
+                // detached body reads it, so a cancelled cycle reaches this line fully intact.
+                guard generation == scanGeneration, !Task.isCancelled else { return .noResolution }
+
                 statusMessage = "Recognized — unlocking…"
                 let livenessNote = livenessEnabled
                     ? (confirmingCue.map { "live via \($0.title)" } ?? "liveness clear")
                     : "liveness off"
                 lastOutcome = "Matched \(readyMatch.identity.name) at \(String(format: "%.3f", readyMatch.centroidSimilarity)), \(livenessNote)."
-                await pocController.injectStoredPassword(requireAuthoritativeLock: true)
+                do {
+                    try await pocController.injectStoredPassword()
+                } catch {
+                    lastOutcome = "Matched, but injection failed: \(error.localizedDescription)"
+                    return .injectionFailed
+                }
+                injectionCooldownUntil = ContinuousClock.now.advanced(by: injectionCooldown)
                 return .matched
             }
 
