@@ -201,6 +201,34 @@ final class GlanceSettings {
 
     static let faceDetectionRange = 3...10
 
+    /// Validates a security-relevant number on the way **in**, not only on the way out.
+    ///
+    /// The Recognition page only ever writes the discrete stops from `MatchConfidenceLevel` /
+    /// `DetectionDistanceLevel`, so it was reasonable to read them back unchecked — but the value
+    /// round-trips through `~/Library/Preferences/com.jonathan.glance.plist`, and App Sandbox is
+    /// off, so that file is plain and writable by any process running as the user. No TCC prompt,
+    /// no admin rights, no Keychain access needed:
+    ///
+    ///     defaults write com.jonathan.glance GlanceSettings.matchThreshold -float -1.0
+    ///
+    /// Cosine similarity is bounded to [-1, 1], so a stored -1.0 makes both comparisons in
+    /// `FaceRecognitionPipeline.bestMatch` unconditionally true and every detected face a match.
+    /// `nearest(to:)` would still label the slider plausibly, so the page looks untouched.
+    ///
+    /// Out-of-range falls back to the named default rather than to the stored value: a tampered
+    /// file must never be able to loosen the gate, only to be ignored.
+    ///
+    /// This deliberately does NOT clamp — clamping -1.0 to 0.55 would silently honour part of an
+    /// attacker's write. It accepts or discards.
+    ///
+    /// Note the limit: `livenessChecksEnabled` is a `Bool` and has no range to validate. Anyone who
+    /// can write this plist can still turn liveness off. That is documented rather than fixed,
+    /// because the same attacker can already run code as the user and read the keyboard directly.
+    private static func clamped(_ stored: Float?, to range: ClosedRange<Float>, fallback: Float) -> Float {
+        guard let stored, range.contains(stored) else { return fallback }
+        return stored
+    }
+
     /// Which display Face Unlock shows on. `nil` means `NotchGeometry.preferredScreen()`'s
     /// default, re-evaluated live; a pinned display has deliberately no
     /// fallback if disconnected (see `FaceUnlockCoordinator.evaluateTrigger()`).
@@ -256,16 +284,22 @@ final class GlanceSettings {
         // Enabled by default — onboarding already enrolled a face and set a
         // password specifically to use Face Unlock.
         isFaceUnlockEnabled = defaults.object(forKey: Key.isFaceUnlockEnabled) as? Bool ?? true
-        // Matches `MatchConfidenceLevel.standard` — see RecognitionSettingsPage.swift.
-        matchThreshold = defaults.object(forKey: Key.matchThreshold) as? Float ?? 0.66
+        matchThreshold = Self.clamped(
+            defaults.object(forKey: Key.matchThreshold) as? Float,
+            to: MatchConfidenceLevel.acceptedRange,
+            fallback: MatchConfidenceLevel.standard.threshold
+        )
         livenessChecksEnabled = defaults.object(forKey: Key.livenessChecksEnabled) as? Bool ?? true
         // Light by default — Heavy requires a blink/pose/depth signal a
         // still, non-blinking user may never produce, while Light still
         // catches the main attack (a photo on a phone screen).
         livenessMode = defaults.string(forKey: Key.livenessMode)
             .flatMap(LivenessMode.init(rawValue:)) ?? .light
-        // Matches `DetectionDistanceLevel.standard` — see RecognitionSettingsPage.swift.
-        minimumFaceWidth = defaults.object(forKey: Key.minimumFaceWidth) as? Float ?? 0.21
+        minimumFaceWidth = Self.clamped(
+            defaults.object(forKey: Key.minimumFaceWidth) as? Float,
+            to: DetectionDistanceLevel.acceptedRange,
+            fallback: DetectionDistanceLevel.standard.minimumFaceWidth
+        )
 
         // Resolve the stored style first, `.none` included, then split it
         // into the pick + the on/off flag the UI now works in.
