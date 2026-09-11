@@ -126,6 +126,23 @@ struct LivenessTuning: Equatable {
     /// not a ramping level, so one firing frame is the event itself.
     var blinkFrames: Int = 1
 
+    /// How many frames a *confirm* cue's firing stays valid after its evidence was last seen.
+    ///
+    /// Deny and confirm cues latch asymmetrically, deliberately. A deny cue latches for the whole
+    /// scan so a spoof tell cannot be waited out. A confirm cue must not, because the same
+    /// permanence is exploitable in the opposite direction: earn a blink or a head turn with a real
+    /// face, then substitute a photo of an enrolled user into the same scan window, and the match
+    /// half is re-evaluated per frame while the liveness half is still holding a confirmation the
+    /// live face earned. Confirmation now expires, so proof of life has to be contemporaneous with
+    /// the face being matched.
+    ///
+    /// Sized a little above `LivenessAnalyzer.windowDuration` (~2s, ~60 frames at 30fps): while the
+    /// evidence is still inside the rolling window the cue keeps re-counting and stays fresh on its
+    /// own, so this only decides the grace period after it ages out. Frames rather than seconds
+    /// because the evaluator is fed readings, not timestamps; that ties it loosely to frame rate,
+    /// which is acceptable for a grace period and keeps the type free of a clock.
+    var confirmFreshnessFrames: Int = 70
+
     /// Frames Light mode waits before auto-confirming, so deny cues get a fair chance to
     /// fire first — otherwise a first-frame match could unlock before glare/device ever ran.
     ///
@@ -199,6 +216,9 @@ struct LivenessCueState: Equatable {
     /// Cumulative, not consecutive — forgiving of one-frame dropouts Vision produces mid-scan.
     var framesCounted: Int = 0
     var hasFired: Bool = false
+    /// `framesObserved` when this cue last saw a confident at-level reading, or 0 if never.
+    /// Only consulted for confirm cues — see `LivenessTuning.confirmFreshnessFrames`.
+    var lastCountedFrame: Int = 0
 
     /// 0...1 progress toward firing, for Face Lab's progress bars.
     func progress(threshold: Int) -> Float {
@@ -273,6 +293,7 @@ struct LivenessEvaluator {
             state.reading = reading
             if reading.confidence > 0, reading.level >= tuning.level(for: cue) {
                 state.framesCounted += 1
+                state.lastCountedFrame = framesObserved
                 if state.framesCounted >= tuning.frames(for: cue) {
                     state.hasFired = true
                 }
@@ -303,12 +324,21 @@ struct LivenessEvaluator {
             return .confirmed(by: nil)
         }
 
+        // Confirm cues expire; deny cues above do not. See `LivenessTuning.confirmFreshnessFrames`
+        // for why the asymmetry is deliberate rather than an oversight.
         for cue in LivenessCue.allCases
-        where cue.role == .confirm && enabledCues.contains(cue) && (states[cue]?.hasFired ?? false) {
+        where cue.role == .confirm && enabledCues.contains(cue) && isFreshlyConfirmed(cue) {
             return .confirmed(by: cue)
         }
 
         return .pending
+    }
+
+    /// Whether `cue` has fired *and* its evidence is recent enough to still vouch for the face
+    /// currently in frame.
+    private func isFreshlyConfirmed(_ cue: LivenessCue) -> Bool {
+        guard let state = states[cue], state.hasFired else { return false }
+        return framesObserved - state.lastCountedFrame <= tuning.confirmFreshnessFrames
     }
 }
 

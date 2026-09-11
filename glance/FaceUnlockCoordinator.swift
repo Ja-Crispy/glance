@@ -38,6 +38,17 @@ final class FaceUnlockCoordinator {
     /// Requires several consecutive below-threshold frames so a single bad-angle read doesn't trigger the failure animation.
     private let wrongFaceStreakThreshold = 6
 
+    /// Consecutive at-threshold frames for the *same* identity before an unlock fires.
+    ///
+    /// Symmetric with `wrongFaceStreakThreshold`, which exists because "a single bad-angle read"
+    /// shouldn't be trusted — an argument that is far stronger on the accept side, where the cost
+    /// of one unlucky read is the login password being typed. Without a streak the gate was not
+    /// "cosine >= threshold" but "max cosine over the whole window >= threshold": the scan polls
+    /// every 20ms for 3-10s, so the threshold was evaluated 75-150 times and one lucky draw from
+    /// the impostor tail was enough. Requiring the same identity three frames running costs ~80ms
+    /// at 30fps and removes the best-of-N amplification.
+    private let matchStreakThreshold = 3
+
     private(set) var statusMessage = "Idle"
     private(set) var lastOutcome: String?
 
@@ -367,6 +378,11 @@ final class FaceUnlockCoordinator {
         let liveness = LivenessAnalyzer()
         liveness.modeProvider = { GlanceSettings.shared.livenessMode }
         var consecutiveWrongFaceFrames = 0
+        /// Counts consecutive at-threshold frames for one identity; see `matchStreakThreshold`.
+        var consecutiveMatchFrames = 0
+        /// Which identity the current accept streak belongs to, so it can't be assembled from
+        /// frames that matched different people.
+        var streakIdentityID: UUID?
 
         /// Cleared the moment a detected face fails to match, so a latched match can't be handed to whoever steps in next.
         var readyMatch: ScoredIdentity?
@@ -427,9 +443,19 @@ final class FaceUnlockCoordinator {
 
             if let matched {
                 consecutiveWrongFaceFrames = 0
-                readyMatch = matched
+                // The streak must be the same person throughout, or three frames of three
+                // different near-misses would satisfy it.
+                if matched.identity.id == streakIdentityID {
+                    consecutiveMatchFrames += 1
+                } else {
+                    streakIdentityID = matched.identity.id
+                    consecutiveMatchFrames = 1
+                }
+                readyMatch = consecutiveMatchFrames >= matchStreakThreshold ? matched : nil
             } else {
                 readyMatch = nil
+                consecutiveMatchFrames = 0
+                streakIdentityID = nil
                 consecutiveWrongFaceFrames += 1
                 if consecutiveWrongFaceFrames >= wrongFaceStreakThreshold {
                     return .consistentlyWrongFace

@@ -476,6 +476,17 @@ struct LivenessSelfTest {
         )
     }
 
+    /// A frame carrying only eye-aspect data, for driving `blinkDynamics` directly. `ear` is the
+    /// eye aspect ratio: a dip well below the surrounding baseline, with open frames either side,
+    /// is what the cue looks for.
+    private static func makeBlinkFrame(at t: TimeInterval, ear: CGFloat) -> LivenessFrame {
+        LivenessFrame(
+            timestamp: Date(timeIntervalSince1970: t), landmarks: [], interocularDistance: nil,
+            yaw: nil, leftEyeAspectRatio: ear, rightEyeAspectRatio: ear, noseOffsetRatio: nil,
+            hasReliableLandmarks: true, deviceOverlapFraction: nil, glare: nil
+        )
+    }
+
     /// Skin: a few small scattered highlights. Screen: a big concentrated
     /// glare blob. Plausible rather than measured — real-device readings
     /// were ~0% on a live face and 30-40% against a phone, which is the
@@ -597,6 +608,75 @@ struct LivenessSelfTest {
             "FAIL: Light mode confirmed on crops too small for the glare cue to judge."
         )
         print("PASS: Light mode fails closed when no deny cue ever had data to judge.")
+
+        // Confirm cues must expire. A blink or head turn earned by a real face, followed by a
+        // photo of an enrolled user swapped into the same scan window, would otherwise unlock:
+        // the match half is re-evaluated every frame while the liveness half still holds a
+        // confirmation the live face earned. Drive a blink, then feed frames with no eye data at
+        // all, and assert the confirmation lapses rather than latching for the whole scan.
+        var expiring = LivenessEvaluator(mode: .heavy, tuning: .default, enabledCues: [.blink])
+        var blinkWindow: [LivenessFrame] = []
+        for (i, ear) in [0.30, 0.30, 0.30, 0.10, 0.30, 0.30].enumerated() {
+            blinkWindow.append(makeBlinkFrame(at: Double(i) * 0.05, ear: CGFloat(ear)))
+            _ = expiring.observe(LivenessCues.readings(window: blinkWindow, geometry: .empty))
+        }
+        precondition(
+            expiring.states[.blink]?.hasFired == true,
+            "FAIL: the synthetic blink did not fire the blink cue — test setup is wrong, not the code."
+        )
+        // Still confirmed while the evidence is fresh.
+        var stillFresh = expiring
+        precondition(
+            stillFresh.observe(LivenessCues.readings(window: blinkWindow, geometry: .empty)).decision.isConfirmed,
+            "FAIL: a blink that just happened should still confirm."
+        )
+        // Now age it out: frames carrying no eye-aspect data, so blinkDynamics abstains.
+        //
+        // The aging count is a FIXED number, deliberately not derived from
+        // `confirmFreshnessFrames`. Deriving it makes the test self-referential and therefore
+        // vacuous: raising the tuning value would lengthen the loop by the same amount and the
+        // assertion would keep passing no matter how long confirmation latched. A fixed count
+        // plus the bound assertion below is what actually pins the behaviour down.
+        let agingFrames = 200
+        precondition(
+            LivenessTuning.default.confirmFreshnessFrames < agingFrames,
+            """
+            FAIL: confirmFreshnessFrames (\(LivenessTuning.default.confirmFreshnessFrames)) is not \
+            below this test's fixed aging window (\(agingFrames)), so the expiry assertion below \
+            would be vacuous. Raise agingFrames or reconsider the tuning.
+            """
+        )
+        var agedDecision = LivenessDecision.pending
+        for i in 0..<agingFrames {
+            agedDecision = expiring.observe(LivenessCues.readings(
+                window: [makeCueFrame(at: 10 + Double(i) * 0.05, glare: skinGlare)], geometry: .empty
+            )).decision
+        }
+        precondition(
+            agedDecision == .pending,
+            "FAIL: a stale blink still confirmed (\(agedDecision)) — confirm cues must expire, or a photo can inherit a live face's proof of life."
+        )
+        print("PASS: a confirm cue expires once its evidence ages out.")
+
+        // The asymmetry is the point: deny cues must still latch forever, so a spoof tell cannot
+        // simply be waited out by holding the photo still.
+        var denyLatch = LivenessEvaluator(mode: .light, tuning: .default, enabledCues: Set(LivenessCue.allCases))
+        for i in 0..<LivenessTuning.default.glossFrames {
+            _ = denyLatch.observe(LivenessCues.readings(
+                window: [makeCueFrame(at: Double(i) * 0.05, glare: screenGlare)], geometry: .empty
+            ))
+        }
+        var latchedDecision = LivenessDecision.pending
+        for i in 0..<agingFrames {
+            latchedDecision = denyLatch.observe(LivenessCues.readings(
+                window: [makeCueFrame(at: 5 + Double(i) * 0.05, glare: skinGlare)], geometry: .empty
+            )).decision
+        }
+        precondition(
+            latchedDecision.isDenied,
+            "FAIL: a deny cue stopped denying once its evidence aged out (\(latchedDecision)) — a spoof could be waited out."
+        )
+        print("PASS: a deny cue latches for the whole scan and cannot be waited out.")
 
         // Deny overrides an existing confirmation: a real 3D face that
         // fires flat-vs-3D, then a device rectangle appears.
