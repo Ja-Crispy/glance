@@ -68,10 +68,17 @@ enum LivenessCue: String, CaseIterable, Hashable, Identifiable {
 /// the difference is only whether a *positive* proof of life is also
 /// required before unlocking.
 enum LivenessMode: String, CaseIterable, Identifiable, Sendable {
-    /// Deny-only: "confirmed unless proven wrong." Never blocks a user who sits still — the default.
+    /// Deny-only: "confirmed unless proven wrong." Never blocks a user who sits still.
+    ///
+    /// Understand what this does and does not stop. The two deny cues look for screen glare and a
+    /// device-shaped rectangle around the face, so Light rejects a phone or tablet held up to the
+    /// camera. It does **not** stop a matte photographic print trimmed along the hairline: that
+    /// produces no specular highlight and no rectangle, so neither cue ever fires and the scan is
+    /// auto-confirmed. Light is "rejects a screen", not "rejects a photo".
     case light
-    /// Deny cues plus at least one confirm cue must fire. Can block a user who holds
-    /// perfectly still and never blinks for the whole scan.
+    /// Deny cues plus at least one confirm cue must fire — the default. Can block a user who holds
+    /// perfectly still and never blinks for the whole scan, which is the intended failure mode:
+    /// they type their password instead.
     case heavy
 
     var id: String { rawValue }
@@ -85,8 +92,10 @@ enum LivenessMode: String, CaseIterable, Identifiable, Sendable {
 
     var summary: String {
         switch self {
-        case .light: return "Only rejects obvious spoofs."
-        case .heavy: return "Also requires proof of a real face."
+        // Names the specific gap rather than the vague "obvious spoofs", which reads as though a
+        // printed photo counts as obvious. It does not — see the case documentation above.
+        case .light: return "Rejects a phone or tablet screen, but not a printed photo."
+        case .heavy: return "Also requires proof of a real face — a blink or head turn."
         }
     }
 }
@@ -119,7 +128,24 @@ struct LivenessTuning: Equatable {
 
     /// Frames Light mode waits before auto-confirming, so deny cues get a fair chance to
     /// fire first — otherwise a first-frame match could unlock before glare/device ever ran.
-    var lightModeMinimumFrames: Int = 3
+    ///
+    /// Must stay comfortably **above** `glossFrames` and `deviceFrames`, not equal to them. At the
+    /// previous value of 3 the deny cues had a budget of exactly 3 frames to accumulate 3 counted
+    /// frames, so they had to fire on every single observation: one dropped Vision detection, one
+    /// frame where `renderCrop` returned nil, and the spoof won on a technicality. 8 gives them
+    /// room for the dropouts that actually happen, and costs ~0.27s at 30fps inside a 3-10s window.
+    var lightModeMinimumFrames: Int = 8
+
+    /// Frames on which at least one enabled deny cue actually produced a *confident* reading,
+    /// required before Light mode will auto-confirm.
+    ///
+    /// Light mode's contract is "confirmed unless proven wrong", which is only meaningful if the
+    /// proving machinery ran at all. Frame count alone does not establish that: `glossGlare`
+    /// abstains outright when `renderCrop` returned no crop, and discounts to zero confidence
+    /// below ~50 native pixels of face — so a face too small or a crop that failed to rasterize
+    /// produced *no* spoof evidence, and Light would still confirm on the strength of having
+    /// counted to three. This makes the absence of evidence fail closed rather than open.
+    var lightModeMinimumDenyEvidenceFrames: Int = 3
 
     nonisolated static let `default` = LivenessTuning()
 
@@ -208,6 +234,10 @@ struct LivenessEvaluator {
 
     private(set) var states: [LivenessCue: LivenessCueState] = [:]
     private(set) var framesObserved: Int = 0
+    /// Frames on which at least one enabled deny cue reported with non-zero confidence — i.e. the
+    /// spoof detectors had real data to judge, rather than abstaining. Gates Light mode's
+    /// auto-confirm; see `LivenessTuning.lightModeMinimumDenyEvidenceFrames`.
+    private(set) var denyEvidenceFrames: Int = 0
 
     init(
         mode: LivenessMode = .light,
@@ -222,11 +252,20 @@ struct LivenessEvaluator {
     mutating func reset() {
         states = [:]
         framesObserved = 0
+        denyEvidenceFrames = 0
     }
 
     /// Firing is latched: a cue that has fired stays fired for the rest of the scan.
     mutating func observe(_ readings: [LivenessCue: CueReading]) -> LivenessSnapshot {
         framesObserved += 1
+
+        // Counted before the per-cue loop so it reflects this frame's readings regardless of
+        // whether any cue crossed its fire level — the question is "did a spoof detector get to
+        // look", not "did it convict".
+        let denyCueReported = LivenessCue.allCases.contains { cue in
+            cue.role == .deny && enabledCues.contains(cue) && (readings[cue] ?? .none).confidence > 0
+        }
+        if denyCueReported { denyEvidenceFrames += 1 }
 
         for cue in LivenessCue.allCases {
             var state = states[cue] ?? LivenessCueState()
@@ -254,7 +293,14 @@ struct LivenessEvaluator {
         }
 
         if mode == .light {
-            return framesObserved >= tuning.lightModeMinimumFrames ? .confirmed(by: nil) : .pending
+            // Both conditions, not just the frame count: enough frames for the deny cues to have
+            // accumulated a firing streak, AND enough frames on which they actually had data to
+            // judge. Staying `.pending` is not a failure — the scan keeps running until either a
+            // deny cue fires or both budgets are met.
+            guard framesObserved >= tuning.lightModeMinimumFrames,
+                  denyEvidenceFrames >= tuning.lightModeMinimumDenyEvidenceFrames
+            else { return .pending }
+            return .confirmed(by: nil)
         }
 
         for cue in LivenessCue.allCases

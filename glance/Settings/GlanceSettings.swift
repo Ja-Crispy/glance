@@ -290,11 +290,19 @@ final class GlanceSettings {
             fallback: MatchConfidenceLevel.standard.threshold
         )
         livenessChecksEnabled = defaults.object(forKey: Key.livenessChecksEnabled) as? Bool ?? true
-        // Light by default — Heavy requires a blink/pose/depth signal a
-        // still, non-blinking user may never produce, while Light still
-        // catches the main attack (a photo on a phone screen).
+        // Heavy by default. This was Light, on the reasoning that Heavy can block a still,
+        // non-blinking user while Light "still catches the main attack (a photo on a phone
+        // screen)". The second half does not hold: Light runs deny cues only, so it rejects a
+        // phone screen via glare or a visible bezel, but a matte print — trimmed so no rectangle
+        // frames the face — triggers neither cue and passes unconditionally. README.md:33 already
+        // states the correct precondition, "heavy liveness detection must be turned on", so the
+        // shipped default was contradicting the project's own security claim.
+        //
+        // The usability cost is real and accepted: over a 3-10s window a user who never blinks and
+        // never turns their head gets "Couldn't confirm a live face" and types their password.
+        // That is the right way for this to fail. Light remains available as an informed choice.
         livenessMode = defaults.string(forKey: Key.livenessMode)
-            .flatMap(LivenessMode.init(rawValue:)) ?? .light
+            .flatMap(LivenessMode.init(rawValue:)) ?? .heavy
         minimumFaceWidth = Self.clamped(
             defaults.object(forKey: Key.minimumFaceWidth) as? Float,
             to: DetectionDistanceLevel.acceptedRange,

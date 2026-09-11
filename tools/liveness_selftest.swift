@@ -554,6 +554,50 @@ struct LivenessSelfTest {
         )
         print("PASS: Light mode waits for its minimum observation window before auto-confirming.")
 
+        // The deny cues need a frame budget strictly larger than their own firing threshold.
+        // At the old budget of 3 they had to fire on all 3 observations, so a single dropped
+        // Vision detection handed the scan to the spoof. Assert the headroom exists.
+        precondition(
+            LivenessTuning.default.lightModeMinimumFrames > LivenessTuning.default.glossFrames &&
+            LivenessTuning.default.lightModeMinimumFrames > LivenessTuning.default.deviceFrames,
+            """
+            FAIL: Light mode's frame budget (\(LivenessTuning.default.lightModeMinimumFrames)) \
+            must exceed both deny-cue thresholds (gloss \(LivenessTuning.default.glossFrames), \
+            device \(LivenessTuning.default.deviceFrames)), or a single dropout defeats them.
+            """
+        )
+        // A denial must still land inside that larger budget rather than being outrun by it.
+        let lateGlare = (0..<LivenessTuning.default.lightModeMinimumFrames).map {
+            makeCueFrame(at: Double($0) * 0.05, glare: screenGlare)
+        }
+        precondition(
+            evaluate(lateGlare, mode: .light).decision.isDenied,
+            "FAIL: sustained glare must deny within Light mode's own frame budget."
+        )
+        print("PASS: Light mode's frame budget leaves the deny cues headroom to fire.")
+
+        // "Confirmed unless proven wrong" is hollow if nothing could do the proving. A face too
+        // small to rasterize a usable crop makes `glossGlare` abstain on every frame, and with no
+        // device rectangle in view `deviceDetected` abstains too — so no deny cue ever had data.
+        // That must stay pending, not auto-confirm on frame count alone.
+        let noEvidence = (0..<20).map { makeCueFrame(at: Double($0) * 0.05, glare: nil) }
+        precondition(
+            evaluate(noEvidence, mode: .light).decision == .pending,
+            """
+            FAIL: Light mode confirmed with no deny-cue evidence at all — got \
+            \(evaluate(noEvidence, mode: .light).decision). Absence of evidence must fail closed.
+            """
+        )
+        // A crop too small for the glare cue to trust (below its ~50px confidence floor) is the
+        // same situation arriving through a different door.
+        let tinyCrop = GlareSample(cropPixelWidth: 20, specularFraction: 0.004, specularClusterRatio: 0.15)
+        let tinyFrames = (0..<20).map { makeCueFrame(at: Double($0) * 0.05, glare: tinyCrop) }
+        precondition(
+            evaluate(tinyFrames, mode: .light).decision == .pending,
+            "FAIL: Light mode confirmed on crops too small for the glare cue to judge."
+        )
+        print("PASS: Light mode fails closed when no deny cue ever had data to judge.")
+
         // Deny overrides an existing confirmation: a real 3D face that
         // fires flat-vs-3D, then a device rectangle appears.
         var mixed = generateLiveSequence(frameCount: frameCount, noiseStd: 0.2, seed: 2)
