@@ -202,6 +202,15 @@ final class FaceUnlockCoordinator {
             statusMessage = "Face unlock is on, but no password is stored yet."
             return
         }
+        // Checked here, not only inside `injectStoredPassword`. macOS commonly resets the
+        // Accessibility grant when a Sparkle update replaces the binary, and without this the app
+        // would happily power the camera, match a face, and fail at the last step on every single
+        // wake — burning battery and, before the `.injectionFailed` outcome existed, painting a
+        // success animation at a screen that stayed locked.
+        guard KeystrokeInjector.isAccessibilityTrusted() else {
+            statusMessage = "Face unlock is on, but Accessibility permission was revoked — re-enable glance in System Settings › Privacy & Security › Accessibility."
+            return
+        }
 
         // A deselected trigger means "don't auto-scan for this signal," not "do nothing" — the user can still opt in by hand.
         let shouldAutoScan = GlanceSettings.shared.unlockTriggers.contains(signal)

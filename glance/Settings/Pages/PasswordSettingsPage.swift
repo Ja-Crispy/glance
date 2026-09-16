@@ -144,12 +144,19 @@ struct PasswordSettingsPage: View {
         }
     }
 
-    /// Face samples must be deleted before the password/session key —
-    /// `deletePassword()` clears the cached session key, and deleting the
-    /// face store requires an unlocked session.
+    /// Face samples are deleted before the password/session key, so that if the face store cannot
+    /// be removed we stop before clearing the key and report it, rather than leaving behind
+    /// ciphertext that nothing can ever read or clear.
+    ///
+    /// That ordering used to be justified as "deleting the face store requires an unlocked
+    /// session", which is not true — `SecureFaceStore.deleteAll()` is a bare `removeItem` with no
+    /// session check. The real reason is failure containment: a surviving `face-identities.enc`
+    /// keeps `hasSessionEncryptedData` true forever, and `unlockSession` then refuses to mint a new
+    /// key, so Glance can never be set up again without an `rm` in Terminal. Previously the delete
+    /// was silent on failure and this reported success regardless.
     private func removePassword() {
         do {
-            FaceEnrollmentStore.shared.deleteAll()
+            try FaceEnrollmentStore.shared.deleteAll()
             try SecureCredentialManager.deletePassword()
             pocController.refreshCredentialStatus()
             statusMessage = "Password and face enrollment removed."

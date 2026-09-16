@@ -222,6 +222,15 @@ final class FaceEnrollmentStore {
             )
             updated.append(committed)
         }
+        // The same guard `persist()` has. This is the only write path that replaces the WHOLE
+        // array rather than mutating `identities` in place, which makes it the one that can
+        // destroy every other enrolled identity — and it was the only one calling
+        // `SecureFaceStore.save` directly instead of going through `persist()`. After a failed
+        // decrypt, enrolling wrote `[newIdentity]` over intact ciphertext. Face Lab's "Add
+        // Identity" and first-run onboarding both reach here without the Your Face page's UI guard.
+        guard hasLoadedSuccessfully else {
+            throw FaceEnrollmentStoreError.storeUnreadable
+        }
         try SecureFaceStore.save(updated)
         identities = updated
         return committed
@@ -259,9 +268,12 @@ final class FaceEnrollmentStore {
 
     /// Removes the file outright (rather than writing an empty array) — the teardown path when the session key
     /// itself is being removed, so no orphaned encrypted file is left behind for the next setup to trip over.
-    func deleteAll() {
+    /// Throws if the file could not actually be removed, so callers stop reporting success over a
+    /// store that survived — and so `hasLoadedSuccessfully` is not set to true on a failed delete,
+    /// which would re-open the overwrite hole `persist()` exists to close.
+    func deleteAll() throws {
+        try SecureFaceStore.deleteAll()
         identities.removeAll()
-        SecureFaceStore.deleteAll()
         loadFailure = nil
         hasLoadedSuccessfully = true
     }
