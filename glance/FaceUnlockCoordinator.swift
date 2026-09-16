@@ -183,6 +183,17 @@ final class FaceUnlockCoordinator {
         // A pinned display that isn't connected bails entirely rather than showing up elsewhere; "Main display" (nil) always resolves.
         guard NotchGeometry.preferredScreen() != nil else { return }
 
+        // ArcFace failed to load, so recognition is running on `VisionFeaturePrintEmbedder` — a
+        // general-purpose image descriptor, not a face-identity model. Existing ArcFace
+        // enrollments already fail closed through `isStale`, which is well designed, but a user who
+        // *enrolls* while the fallback is active stores samples tagged `vision-feature-print-v1`,
+        // `isStale` returns false, and unlock then compares feature prints against a 0.66 cutoff
+        // chosen for ArcFace. On this project's own numbers feature prints separate two different
+        // people by roughly 0.10-0.14 cosine, so that cutoff is meaningless. Refuse to arm.
+        guard !pipeline.usingFallbackEmbedder else {
+            statusMessage = "Face unlock is off: the recognition model failed to load, and the fallback isn't accurate enough to unlock with."
+            return
+        }
         guard SecureCredentialManager.isSessionUnlocked else {
             statusMessage = "Face unlock is on, but the session is locked — authenticate once from Password settings first."
             return
@@ -255,6 +266,8 @@ final class FaceUnlockCoordinator {
               GlanceSettings.shared.unlockTriggers.contains(.onSpace),
               LockMonitor.isScreenActuallyLocked(),
               NotchGeometry.preferredScreen() != nil,
+              // Same fallback-embedder refusal as `evaluateTrigger` — this path bypasses it.
+              !pipeline.usingFallbackEmbedder,
               SecureCredentialManager.isSessionUnlocked,
               SecureCredentialManager.hasStoredPassword()
         else { return }
@@ -474,6 +487,27 @@ final class FaceUnlockCoordinator {
                 continue
             }
             lastFaceBoundingBox = result.face.normalizedBoundingBox
+
+            // Enrollment already refuses anything but 5-point alignment and quality >= 0.2; the
+            // unlock path applied neither. A `.paddedCrop` is an aspect-distorted, unrotated box
+            // force-resized to 112x112 — far outside ArcFace's training distribution, and
+            // out-of-distribution inputs to a metric-learning model collapse toward a low-variance
+            // region where *different* identities score high mutual cosine. That raises the
+            // false-accept rate in a way testing never surfaces, because the genuine user almost
+            // always gets `.fivePoint`. The codebase already treats the tier as load-bearing:
+            // LivenessFeatures passes `hasReliableLandmarks: result.alignmentTier == .fivePoint`.
+            //
+            // Treated as a no-face frame rather than a wrong-face frame: a degraded alignment says
+            // nothing about *who* is in front of the camera, so it must not spend the wrong-face
+            // streak either.
+            guard result.alignmentTier == .fivePoint, (result.quality ?? 0) >= 0.2 else {
+                consecutiveWrongFaceFrames = 0
+                consecutiveMatchFrames = 0
+                streakIdentityID = nil
+                readyMatch = nil
+                try? await Task.sleep(nanoseconds: 20_000_000)
+                continue
+            }
 
             // Fed regardless of match, so liveness stays a genuinely independent gate rather than one starved by recognition confidence.
             var confirmingCue: LivenessCue?

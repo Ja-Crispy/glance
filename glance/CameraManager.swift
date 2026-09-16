@@ -160,6 +160,14 @@ final class CameraManager: NSObject {
     }
 
     fileprivate func publish(frame: CameraFrame) {
+        // A late delegate hop must not resurrect a stopped session's frame. `stop()` clears
+        // `currentFrame` on the MainActor, but sample-buffer callbacks already in flight have
+        // queued a `Task { @MainActor }` that lands *after* it and repopulates it — and nothing
+        // clears it again. The next scan starts with `lastProcessedFrameID = nil`, so it consumed
+        // that stale frame as its frame #1, stamped `Date()` as though it were current. Every
+        // motion-derived liveness cue reads the opening frames of a scan, so a frame captured
+        // seconds or hours earlier was corrupting exactly the signal meant to prove liveness.
+        guard isRunning else { return }
         currentFrame = frame
     }
 

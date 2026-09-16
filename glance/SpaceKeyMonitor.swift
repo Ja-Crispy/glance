@@ -9,7 +9,9 @@
 //
 //  Graceful degradation: if access isn't granted or `IOHIDManagerOpen` fails, `start()` no-ops rather than crashing.
 //
-//  Not a keylogger: only runs while locked + opted into "On space", and the callback checks only whether the key is the spacebar.
+//  Not a keylogger, and enforced rather than merely intended: `IOHIDManagerSetInputValueMatching`
+//  restricts delivery to the spacebar element at the IOKit boundary, so no other key usage is ever
+//  handed to this process. The monitor also only runs while locked and opted into "On space".
 //
 
 import Foundation
@@ -83,6 +85,17 @@ final class SpaceKeyMonitor {
             kIOHIDDeviceUsageKey: kHIDUsage_GD_Keyboard,
         ]
         IOHIDManagerSetDeviceMatching(mgr, match as CFDictionary)
+
+        // Device matching selects which *devices* are opened; it cannot restrict which *elements*
+        // are delivered. Without this second call every key usage from every attached keyboard
+        // crossed into this process and was discarded by a `guard` in the callback below — while
+        // the user types their login password at the lock screen. Filtering at the IOKit boundary
+        // means the other usages are never delivered at all, so the file header's "not a keylogger"
+        // claim describes an enforced restriction rather than a convention the callback follows.
+        IOHIDManagerSetInputValueMatching(mgr, [
+            kIOHIDElementUsagePageKey: kHIDPage_KeyboardOrKeypad,
+            kIOHIDElementUsageKey: kHIDUsage_KeyboardSpacebar,
+        ] as CFDictionary)
 
         // Capture-less C callback; `self` threaded through the context pointer. `passUnretained` is safe since this object
         // always `stop()`s (unregistering) before deallocation.

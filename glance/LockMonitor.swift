@@ -123,10 +123,21 @@ final class LockMonitor {
     }
 
     /// Authoritative lock state from the CoreGraphics session server, not a spoofable notification. Fails closed if unavailable.
+    ///
+    /// Checks **both** bits, not just the locked one. `CGSessionCopyCurrentDictionary()` describes
+    /// the calling process's own session, so `CGSSessionScreenIsLocked` answers "is my session's
+    /// screen locked", not "am I the session on console". Under fast user switching those are
+    /// different questions: with another user switched in, this process sits in a background
+    /// session that still reports locked while someone else owns the keyboard. Synthesizing
+    /// keystrokes then types the password into *their* session. Only the conjunction makes it safe.
+    ///
+    /// Both default to `false`, so a missing key or an unavailable dictionary fails closed.
     nonisolated static func isScreenActuallyLocked() -> Bool {
         guard let dict = CGSessionCopyCurrentDictionary() as? [String: Any] else {
             return false
         }
-        return (dict["CGSSessionScreenIsLocked"] as? Bool) ?? false
+        let locked = (dict["CGSSessionScreenIsLocked"] as? Bool) ?? false
+        let onConsole = (dict["kCGSSessionOnConsoleKey"] as? Bool) ?? false
+        return locked && onConsole
     }
 }
