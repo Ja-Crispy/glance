@@ -12,7 +12,12 @@ import Observation
 @MainActor
 final class AppEnvironment {
     let pocController = POCController()
-    let faceLabController = FaceLabController()
+    /// Built on first access, not at launch. `FaceLabController` owns a `FaceRecognitionPipeline`,
+    /// which synchronously loads an ArcFace `MLModel` on the MainActor — real launch latency for a
+    /// debug console that is reached by clicking the About page's icon five times, and that most
+    /// users will never open. `@ObservationIgnored` because the reference never changes; the
+    /// controller is itself `@Observable`, so views still track its contents.
+    @ObservationIgnored private(set) lazy var faceLabController = FaceLabController()
     let faceUnlockCoordinator: FaceUnlockCoordinator
     /// Held, not just constructed — owns a repeating timer that would silently stop enforcing auto-lock if deallocated.
     let sessionAutoLocker: SessionAutoLocker

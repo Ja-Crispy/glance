@@ -133,7 +133,7 @@ final class CameraManager: NSObject {
         if let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) {
             session.addInput(input)
             currentInput = input
-            selectHighestResolutionFormat(for: device)
+            selectCaptureFormat(for: device)
         } else {
             currentInput = nil
             errorMessage = "No camera device found."
@@ -141,21 +141,53 @@ final class CameraManager: NSObject {
         session.commitConfiguration()
     }
 
-    /// Highest resolution regardless of fps — Vision still works from the downscaled frame; this only affects
-    /// what `CameraFrame.source` (and therefore `renderCrop`) has to work with.
-    private func selectHighestResolutionFormat(for device: AVCaptureDevice) {
-        let best = device.formats.max { lhs, rhs in
-            let l = CMVideoFormatDescriptionGetDimensions(lhs.formatDescription)
-            let r = CMVideoFormatDescriptionGetDimensions(rhs.formatDescription)
-            return Int(l.width) * Int(l.height) < Int(r.width) * Int(r.height)
+    /// Smallest format that still carries enough detail, rather than the largest available.
+    ///
+    /// This used to pick maximum area regardless of frame rate. On a 4K webcam or a Continuity
+    /// Camera that is ~33MB per BGRA frame at ~1GB/s through the capture pipeline, and every frame
+    /// is then downscaled to a 640px working image and a crop capped at 448px — whose only
+    /// consumer, the glare cue, saturates its confidence at 130px. The extra pixels were rendered
+    /// and discarded, at the cost of sustained memory bandwidth and thermals on a battery-powered
+    /// machine with the camera light on.
+    ///
+    /// 720p is the floor: it leaves ample margin over the 448px crop even for a face filling a
+    /// fraction of the frame. Frame duration is pinned explicitly so a 60fps variant of the chosen
+    /// format cannot be selected implicitly and double the work for no benefit.
+    private func selectCaptureFormat(for device: AVCaptureDevice) {
+        let minimumHeight: Int32 = 720
+        let targetFrameRate = 30.0
+
+        func supports30fps(_ format: AVCaptureDevice.Format) -> Bool {
+            format.videoSupportedFrameRateRanges.contains {
+                $0.minFrameRate <= targetFrameRate && targetFrameRate <= $0.maxFrameRate
+            }
         }
-        guard let best else { return }
+        func area(_ format: AVCaptureDevice.Format) -> Int {
+            let d = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            return Int(d.width) * Int(d.height)
+        }
+
+        let eligible = device.formats.filter { format in
+            let d = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            return d.height >= minimumHeight && supports30fps(format)
+        }
+        // Falls back to the old behaviour if nothing qualifies, so an unusual camera that offers no
+        // 30fps format at 720p or better still works rather than being left unconfigured.
+        let chosen = eligible.min { area($0) < area($1) }
+            ?? device.formats.max { area($0) < area($1) }
+        guard let chosen else { return }
+
         do {
             try device.lockForConfiguration()
-            device.activeFormat = best
+            device.activeFormat = chosen
+            let duration = CMTime(value: 1, timescale: CMTimeScale(targetFrameRate))
+            if supports30fps(chosen) {
+                device.activeVideoMinFrameDuration = duration
+                device.activeVideoMaxFrameDuration = duration
+            }
             device.unlockForConfiguration()
         } catch {
-            errorMessage = "Couldn't select the camera's highest-resolution format: \(error.localizedDescription)"
+            errorMessage = "Couldn't configure the camera format: \(error.localizedDescription)"
         }
     }
 
